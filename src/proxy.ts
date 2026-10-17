@@ -1,0 +1,171 @@
+import { createRateLimiter } from "./rateLimit";
+
+export type GatewayConfig = {
+    // Path prefix -> upstream base URL, e.g. { "/api/auth": "http://auth:4000" }.
+    upstreams: Record<string, string>;
+    // The browser frontend allowed to call the API with cookies.
+    corsOrigin: string;
+    rateLimit: { limit: number; windowMs: number };
+    log: (line: Record<string, unknown>) => void;
+};
+
+// Headers that describe a single connection, not the request, so they must
+// not be passed on (RFC 9110 §7.6.1). Host is set by fetch for the upstream.
+const HOP_BY_HOP = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+];
+
+export function createGateway(config: GatewayConfig) {
+    const allow = createRateLimiter(config.rateLimit);
+    // Longest prefix first, so "/api/auth/x" never matches a shorter "/api".
+    const upstreams = Object.entries(config.upstreams).sort(
+        ([a], [b]) => b.length - a.length,
+    );
+
+    // The gateway is the only address the browser talks to, so CORS lives
+    // here and whatever the services send is replaced.
+    const corsHeaders = {
+        "Access-Control-Allow-Origin": config.corsOrigin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Methods":
+            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Max-Age": "600",
+        Vary: "Origin",
+    };
+
+    function json(body: unknown, status: number) {
+        return Response.json(body, { status });
+    }
+
+    function findUpstream(pathname: string) {
+        for (const [prefix, target] of upstreams) {
+            if (pathname === prefix || pathname.startsWith(`${prefix}/`)) {
+                return { target, path: pathname.slice(prefix.length) || "/" };
+            }
+        }
+        return null;
+    }
+
+    async function forward(
+        request: Request,
+        target: string,
+        path: string,
+        clientIp: string,
+        requestId: string,
+    ) {
+        const url = new URL(request.url);
+        const headers = new Headers(request.headers);
+        for (const name of HOP_BY_HOP) headers.delete(name);
+        // Appended, so the last entry is always the real client: services
+        // that trust the gateway (auth_service's TRUST_PROXY) read that one.
+        const forwardedFor = request.headers.get("x-forwarded-for");
+        headers.set(
+            "X-Forwarded-For",
+            forwardedFor ? `${forwardedFor}, ${clientIp}` : clientIp,
+        );
+        headers.set("X-Forwarded-Host", url.host);
+        headers.set("X-Forwarded-Proto", url.protocol.slice(0, -1));
+        headers.set("X-Request-Id", requestId);
+
+        const hasBody = request.method !== "GET" && request.method !== "HEAD";
+        const upstream = await fetch(`${target}${path}${url.search}`, {
+            method: request.method,
+            headers,
+            // Streamed, so a 25 MB upload isn't buffered in the gateway.
+            body: hasBody ? request.body : undefined,
+            redirect: "manual",
+            // Pass compressed bodies through as-is, with their headers.
+            decompress: false,
+        });
+
+        const responseHeaders = new Headers(upstream.headers);
+        for (const name of HOP_BY_HOP) responseHeaders.delete(name);
+        for (const name of [...responseHeaders.keys()]) {
+            if (name.startsWith("access-control-")) {
+                responseHeaders.delete(name);
+            }
+        }
+        return new Response(upstream.body, {
+            status: upstream.status,
+            statusText: upstream.statusText,
+            headers: responseHeaders,
+        });
+    }
+
+    async function route(
+        request: Request,
+        clientIp: string,
+        requestId: string,
+    ): Promise<Response> {
+        const { pathname } = new URL(request.url);
+
+        if (pathname === "/health") return json({ status: "ok" }, 200);
+
+        const match = findUpstream(pathname);
+        if (!match) return json({ error: "Not found" }, 404);
+
+        // Preflights are answered here and never reach the services.
+        if (request.method === "OPTIONS") {
+            return new Response(null, { status: 204 });
+        }
+
+        if (!allow(clientIp)) {
+            return json({ error: "Too many requests" }, 429);
+        }
+
+        try {
+            return await forward(
+                request,
+                match.target,
+                match.path,
+                clientIp,
+                requestId,
+            );
+        } catch (error) {
+            config.log({
+                level: "error",
+                requestId,
+                message: "Upstream request failed",
+                upstream: match.target,
+                error: String(error),
+            });
+            return json({ error: "Upstream unavailable" }, 502);
+        }
+    }
+
+    return async function handle(
+        request: Request,
+        server: Bun.Server<unknown>,
+    ): Promise<Response> {
+        const started = performance.now();
+        const clientIp = server.requestIP(request)?.address ?? "unknown";
+        const requestId =
+            request.headers.get("x-request-id") ?? crypto.randomUUID();
+
+        const response = await route(request, clientIp, requestId);
+        for (const [name, value] of Object.entries(corsHeaders)) {
+            response.headers.set(name, value);
+        }
+        response.headers.set("X-Request-Id", requestId);
+
+        const { pathname } = new URL(request.url);
+        config.log({
+            level: "info",
+            requestId,
+            method: request.method,
+            path: pathname,
+            status: response.status,
+            ms: Math.round(performance.now() - started),
+        });
+        return response;
+    };
+}
