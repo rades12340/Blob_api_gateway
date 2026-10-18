@@ -3,10 +3,10 @@
 The single address the Blob_storage frontend talks to. It routes each request to the right service by path prefix, so the browser never needs to know where auth_service or blob_storage run.
 
 ```
-Browser ──▶ blob_frontend (Next.js, :5173)
-   │  fetch(credentials: "include")
+Browser ──/api/*──▶ blob_frontend (Next.js, :5173)
+   │  forwards /api/* server side
    ▼
-api_gateway (:8080)   CORS, rate limit, request ids, logging
+api_gateway (:8080)   rate limit, request ids, logging (+ CORS for direct callers)
    ├── /api/auth/*  ──▶ auth_service  (:4000)
    └── /api/blob/*  ──▶ blob_storage  (:3000)
 Browser ──presigned link──▶ S3 (downloads go straight to S3)
@@ -35,6 +35,7 @@ bun run dev   # http://localhost:8080, expects auth on :4000 and blob on :3000
 | `BLOB_URL` | `http://localhost:3000` | Where `/api/blob/*` goes. |
 | `CORS_ORIGIN` | `http://localhost:5173` | Browser frontend allowed to call the API with cookies. |
 | `RATE_LIMIT` | `300` | Requests per minute per client IP. |
+| `TRUST_PROXY` | `false` | `true` when requests arrive through blob_frontend's server (compose sets it). The client IP is then the last `X-Forwarded-For` entry instead of the connecting address. |
 
 ### Run with Docker
 
@@ -61,13 +62,15 @@ cd ../Blob_frontend && docker compose up -d --build  # :5173, open this one
 
 On the way in it removes connection headers and sets:
 
-- `X-Forwarded-For`: the client's address is **appended**, so the last entry is always the real one. auth_service with `TRUST_PROXY=true` rate limits logins on that entry.
+- `X-Forwarded-For`: the last entry is always the real client. Without `TRUST_PROXY`, the connecting address is appended. With it, the chain from blob_frontend (which already ends with the browser's address) is passed on unchanged. auth_service with `TRUST_PROXY=true` rate limits logins on that last entry.
 - `X-Forwarded-Host`, `X-Forwarded-Proto`.
 - `X-Request-Id`: kept if the client sent one, otherwise a new UUID. It is also returned on the response and appears in the log line, so one request can be followed across services.
 
 On the way out it passes the status, body and every `Set-Cookie` header through, and replaces any CORS headers from the services with its own (`Access-Control-Allow-Origin: CORS_ORIGIN`, `Allow-Credentials: true`).
 
-The frontend at `localhost:5173` and the gateway at `localhost:8080` count as the same site (the port is ignored), so auth_service's `SameSite=Strict` refresh cookie is still sent.
+The browser never calls the gateway directly: blob_frontend forwards `/api/*` from its own address, so auth_service's `SameSite=Strict` refresh cookie is first-party on whatever host the app is opened with. CORS here only matters for tools that call `:8080` directly.
+
+`TRUST_PROXY=true` means anyone who can reach `:8080` directly can choose their own rate-limit key with `X-Forwarded-For`. That's fine locally; in production, don't expose the gateway's port, so only blob_frontend can reach it.
 
 Each request writes one JSON line to stdout: `{ level, requestId, method, path, status, ms }`.
 

@@ -6,6 +6,8 @@ export type GatewayConfig = {
     // The browser frontend allowed to call the API with cookies.
     corsOrigin: string;
     rateLimit: { limit: number; windowMs: number };
+    // Only behind a proxy that appends X-Forwarded-For, such as blob_frontend.
+    trustProxy: boolean;
     log: (line: Record<string, unknown>) => void;
 };
 
@@ -59,19 +61,13 @@ export function createGateway(config: GatewayConfig) {
         request: Request,
         target: string,
         path: string,
-        clientIp: string,
+        forwardedFor: string,
         requestId: string,
     ) {
         const url = new URL(request.url);
         const headers = new Headers(request.headers);
         for (const name of HOP_BY_HOP) headers.delete(name);
-        // Appended, so the last entry is always the real client: services
-        // that trust the gateway (auth_service's TRUST_PROXY) read that one.
-        const forwardedFor = request.headers.get("x-forwarded-for");
-        headers.set(
-            "X-Forwarded-For",
-            forwardedFor ? `${forwardedFor}, ${clientIp}` : clientIp,
-        );
+        headers.set("X-Forwarded-For", forwardedFor);
         headers.set("X-Forwarded-Host", url.host);
         headers.set("X-Forwarded-Proto", url.protocol.slice(0, -1));
         headers.set("X-Request-Id", requestId);
@@ -104,6 +100,7 @@ export function createGateway(config: GatewayConfig) {
     async function route(
         request: Request,
         clientIp: string,
+        forwardedFor: string,
         requestId: string,
     ): Promise<Response> {
         const { pathname } = new URL(request.url);
@@ -127,7 +124,7 @@ export function createGateway(config: GatewayConfig) {
                 request,
                 match.target,
                 match.path,
-                clientIp,
+                forwardedFor,
                 requestId,
             );
         } catch (error) {
@@ -147,11 +144,31 @@ export function createGateway(config: GatewayConfig) {
         server: Bun.Server<unknown>,
     ): Promise<Response> {
         const started = performance.now();
-        const clientIp = server.requestIP(request)?.address ?? "unknown";
+        const socketIp = server.requestIP(request)?.address ?? "unknown";
+        const incoming = request.headers.get("x-forwarded-for");
+        // Behind blob_frontend's server, every request comes from that server.
+        // With trustProxy, the client is the last entry it appended, and the
+        // chain goes on unchanged. Otherwise the socket address is the client
+        // and is appended. Either way the last entry is the real client, which
+        // is the one services that trust the gateway (auth_service) read.
+        const trusted = config.trustProxy
+            ? incoming?.split(",").at(-1)?.trim()
+            : undefined;
+        const clientIp = trusted || socketIp;
+        const forwardedFor = trusted
+            ? (incoming as string)
+            : incoming
+              ? `${incoming}, ${socketIp}`
+              : socketIp;
         const requestId =
             request.headers.get("x-request-id") ?? crypto.randomUUID();
 
-        const response = await route(request, clientIp, requestId);
+        const response = await route(
+            request,
+            clientIp,
+            forwardedFor,
+            requestId,
+        );
         for (const [name, value] of Object.entries(corsHeaders)) {
             response.headers.set(name, value);
         }
