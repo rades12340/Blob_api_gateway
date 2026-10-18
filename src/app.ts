@@ -15,6 +15,7 @@ export function startGateway(options: GatewayOptions = {}) {
             limit: Number(env.RATE_LIMIT ?? 300),
             windowMs: 60_000,
         },
+        trustProxy: options.trustProxy ?? env.TRUST_PROXY === "true",
         log: options.log ?? ((line) => console.log(JSON.stringify(line))),
     });
 

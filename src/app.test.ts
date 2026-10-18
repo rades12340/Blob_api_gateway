@@ -186,3 +186,32 @@ test("logs one line per request", async () => {
     });
     expect(typeof logs[0]?.requestId).toBe("string");
 });
+
+test("with trustProxy, rate limits by the last X-Forwarded-For entry and forwards the chain unchanged", async () => {
+    const { base } = setup({
+        rateLimit: { limit: 1, windowMs: 60_000 },
+        trustProxy: true,
+    });
+    const get = (forwardedFor: string) =>
+        fetch(`${base}/api/auth/me`, {
+            headers: { "X-Forwarded-For": forwardedFor },
+        });
+
+    const first = await get("10.0.0.1");
+    expect(first.status).toBe(200);
+    expect((await first.json()).headers["x-forwarded-for"]).toBe("10.0.0.1");
+    expect((await get("10.0.0.2")).status).toBe(200);
+    // A spoofed first entry doesn't give 10.0.0.1 a fresh budget.
+    expect((await get("1.2.3.4, 10.0.0.1")).status).toBe(429);
+});
+
+test("without trustProxy, X-Forwarded-For doesn't change the rate limit key", async () => {
+    const { base } = setup({ rateLimit: { limit: 1, windowMs: 60_000 } });
+    const get = (forwardedFor: string) =>
+        fetch(`${base}/api/auth/me`, {
+            headers: { "X-Forwarded-For": forwardedFor },
+        });
+
+    expect((await get("10.0.0.1")).status).toBe(200);
+    expect((await get("10.0.0.2")).status).toBe(429);
+});
