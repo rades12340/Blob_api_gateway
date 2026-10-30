@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { type GatewayOptions, startGateway } from "./app";
+import { createLogger } from "./log";
 
 const servers: { stop: (force?: boolean) => unknown }[] = [];
 
@@ -37,8 +38,19 @@ function startEcho(name: string) {
     return `http://127.0.0.1:${server.port}`;
 }
 
-function setup(options: GatewayOptions = {}) {
+function setup(options: GatewayOptions = {}, level = "info") {
+    const raw: string[] = [];
+    // Request lines only; the startup "listening" line is left out.
     const logs: Record<string, unknown>[] = [];
+    const log = createLogger({
+        service: "api_gateway",
+        level,
+        write: (line) => {
+            raw.push(line);
+            const parsed = JSON.parse(line);
+            if (parsed.message !== "listening") logs.push(parsed);
+        },
+    });
     const gateway = startGateway({
         port: 0,
         upstreams: {
@@ -47,11 +59,11 @@ function setup(options: GatewayOptions = {}) {
         },
         corsOrigin: "http://app.test",
         rateLimit: { limit: 100, windowMs: 60_000 },
-        log: (line) => logs.push(line),
+        log,
         ...options,
     });
     servers.push(gateway);
-    return { base: `http://127.0.0.1:${gateway.port}`, logs };
+    return { base: `http://127.0.0.1:${gateway.port}`, logs, raw };
 }
 
 test("routes by prefix and strips it, keeping the query", async () => {
@@ -160,31 +172,148 @@ test("returns 502 when a service is down", async () => {
     const response = await fetch(`${base}/api/auth/me`);
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({ error: "Upstream unavailable" });
-    expect(logs.some((line) => line.level === "error")).toBe(true);
+    const failed = logs.find(
+        (line) => line.message === "upstream request failed",
+    );
+    expect(failed).toMatchObject({
+        level: "error",
+        upstream: "auth",
+        requestId: response.headers.get("x-request-id"),
+    });
+    expect(typeof failed?.error).toBe("string");
+    expect(logs.at(-1)).toMatchObject({ message: "request", status: 502 });
 });
 
 test("rate limits per client", async () => {
-    const { base } = setup({ rateLimit: { limit: 2, windowMs: 60_000 } });
+    const { base, logs } = setup({
+        rateLimit: { limit: 2, windowMs: 60_000 },
+    });
 
     expect((await fetch(`${base}/api/auth/me`)).status).toBe(200);
     expect((await fetch(`${base}/api/auth/me`)).status).toBe(200);
-    expect((await fetch(`${base}/api/auth/me`)).status).toBe(429);
+    const limited = await fetch(`${base}/api/auth/me`);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("x-request-id")).toBeTruthy();
+    const warning = logs.find((line) => line.message === "rate limited");
+    expect(warning).toMatchObject({
+        level: "warn",
+        service: "api_gateway",
+        requestId: limited.headers.get("x-request-id"),
+    });
+    expect(typeof warning?.clientIp).toBe("string");
     // Health checks aren't counted.
     expect((await fetch(`${base}/health`)).status).toBe(200);
 });
 
-test("logs one line per request", async () => {
+test("logs one access line per request, without the query string", async () => {
     const { base, logs } = setup();
-    await fetch(`${base}/api/blob/files`);
+    const response = await fetch(`${base}/api/blob/files?token=secret-q`);
 
     expect(logs).toHaveLength(1);
-    expect(logs[0]).toMatchObject({
+    const line = logs[0] ?? {};
+    expect(line).toMatchObject({
         level: "info",
+        service: "api_gateway",
+        message: "request",
         method: "GET",
         path: "/api/blob/files",
         status: 200,
+        upstream: "blob",
+        requestId: response.headers.get("x-request-id"),
     });
-    expect(typeof logs[0]?.requestId).toBe("string");
+    expect(Number.isInteger(line.ms)).toBe(true);
+    expect(typeof line.clientIp).toBe("string");
+    expect(new Date(String(line.time)).toISOString()).toBe(String(line.time));
+    expect(JSON.stringify(line)).not.toContain("secret-q");
+});
+
+test("access line has no upstream for unrouted paths, and 404 gets a request id", async () => {
+    const { base, logs } = setup();
+    const response = await fetch(`${base}/nowhere`);
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("x-request-id")).toBeTruthy();
+    expect(logs[0]).toMatchObject({ path: "/nowhere", status: 404 });
+    expect(logs[0]).not.toHaveProperty("upstream");
+});
+
+test("generates a request id when none is sent, and forwards it upstream", async () => {
+    const { base, logs } = setup();
+    const response = await fetch(`${base}/api/auth/me`);
+    const id = response.headers.get("x-request-id");
+
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect((await response.json()).headers["x-request-id"]).toBe(id);
+    expect(logs[0]?.requestId).toBe(id);
+});
+
+test("replaces an invalid request id", async () => {
+    const { base, logs } = setup();
+    for (const bad of ["has spaces in it", "a".repeat(500)]) {
+        const response = await fetch(`${base}/api/auth/me`, {
+            headers: { "X-Request-Id": bad },
+        });
+        const id = response.headers.get("x-request-id");
+        expect(id).not.toBe(bad);
+        expect(id).toMatch(/^[0-9a-f-]{36}$/);
+        expect((await response.json()).headers["x-request-id"]).toBe(id);
+        expect(logs.at(-1)?.requestId).toBe(id);
+    }
+});
+
+test("never logs the Authorization header or cookies", async () => {
+    const { base, raw } = setup({
+        upstreams: { "/api/auth": "http://127.0.0.1:1" },
+    });
+    await fetch(`${base}/api/auth/refresh?code=query-secret`, {
+        method: "POST",
+        headers: {
+            Authorization: "Bearer secret-access-token",
+            Cookie: "refresh_token=secret-cookie-value",
+        },
+    });
+
+    expect(raw.length).toBeGreaterThan(1);
+    for (const line of raw) {
+        expect(line).not.toContain("secret-access-token");
+        expect(line).not.toContain("secret-cookie-value");
+        expect(line).not.toContain("query-secret");
+    }
+});
+
+test("LOG_LEVEL drops lower levels", async () => {
+    const { base, logs } = setup(
+        {
+            upstreams: { "/api/auth": "http://127.0.0.1:1" },
+            rateLimit: { limit: 1, windowMs: 60_000 },
+        },
+        "error",
+    );
+    await fetch(`${base}/api/auth/me`);
+    await fetch(`${base}/api/auth/me`);
+
+    expect(logs.map((line) => line.message)).toEqual([
+        "upstream request failed",
+    ]);
+});
+
+test("createLogger treats an unknown level as info and writes one JSON line per call", () => {
+    const lines: string[] = [];
+    const log = createLogger({
+        service: "test",
+        level: "bogus",
+        write: (line) => lines.push(line),
+    });
+    log.debug("hidden");
+    log.info("shown", { requestId: "r1" });
+
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] ?? "")).toMatchObject({
+        level: "info",
+        service: "test",
+        message: "shown",
+        requestId: "r1",
+    });
 });
 
 test("with trustProxy, rate limits by the last X-Forwarded-For entry and forwards the chain unchanged", async () => {

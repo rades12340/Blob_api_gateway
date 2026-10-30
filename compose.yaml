@@ -16,6 +16,12 @@ services:
       # Browsers reach the gateway through blob_frontend's server, which
       # appends the browser's address to X-Forwarded-For.
       TRUST_PROXY: "true"
+      LOG_LEVEL: info
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - blob-storage
 

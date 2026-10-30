@@ -1,3 +1,4 @@
+import type { Logger } from "./log";
 import { createRateLimiter } from "./rateLimit";
 
 export type GatewayConfig = {
@@ -8,7 +9,7 @@ export type GatewayConfig = {
     rateLimit: { limit: number; windowMs: number };
     // Only behind a proxy that appends X-Forwarded-For, such as blob_frontend.
     trustProxy: boolean;
-    log: (line: Record<string, unknown>) => void;
+    log: Logger;
 };
 
 // Headers that describe a single connection, not the request, so they must
@@ -24,6 +25,10 @@ const HOP_BY_HOP = [
     "upgrade",
     "host",
 ];
+
+// Ids we accept from the client; anything else is replaced, so log lines and
+// upstream headers can't carry arbitrary text.
+const REQUEST_ID = /^[A-Za-z0-9._-]{1,128}$/;
 
 export function createGateway(config: GatewayConfig) {
     const allow = createRateLimiter(config.rateLimit);
@@ -51,7 +56,12 @@ export function createGateway(config: GatewayConfig) {
     function findUpstream(pathname: string) {
         for (const [prefix, target] of upstreams) {
             if (pathname === prefix || pathname.startsWith(`${prefix}/`)) {
-                return { target, path: pathname.slice(prefix.length) || "/" };
+                return {
+                    // "/api/auth" -> "auth", the name used in log lines.
+                    name: prefix.split("/").at(-1) || prefix,
+                    target,
+                    path: pathname.slice(prefix.length) || "/",
+                };
             }
         }
         return null;
@@ -99,15 +109,14 @@ export function createGateway(config: GatewayConfig) {
 
     async function route(
         request: Request,
+        pathname: string,
+        match: ReturnType<typeof findUpstream>,
         clientIp: string,
         forwardedFor: string,
         requestId: string,
     ): Promise<Response> {
-        const { pathname } = new URL(request.url);
-
         if (pathname === "/health") return json({ status: "ok" }, 200);
 
-        const match = findUpstream(pathname);
         if (!match) return json({ error: "Not found" }, 404);
 
         // Preflights are answered here and never reach the services.
@@ -116,6 +125,7 @@ export function createGateway(config: GatewayConfig) {
         }
 
         if (!allow(clientIp)) {
+            config.log.warn("rate limited", { requestId, clientIp });
             return json({ error: "Too many requests" }, 429);
         }
 
@@ -128,11 +138,9 @@ export function createGateway(config: GatewayConfig) {
                 requestId,
             );
         } catch (error) {
-            config.log({
-                level: "error",
+            config.log.error("upstream request failed", {
                 requestId,
-                message: "Upstream request failed",
-                upstream: match.target,
+                upstream: match.name,
                 error: String(error),
             });
             return json({ error: "Upstream unavailable" }, 502);
@@ -160,11 +168,19 @@ export function createGateway(config: GatewayConfig) {
             : incoming
               ? `${incoming}, ${socketIp}`
               : socketIp;
+        const incomingId = request.headers.get("x-request-id");
         const requestId =
-            request.headers.get("x-request-id") ?? crypto.randomUUID();
+            incomingId && REQUEST_ID.test(incomingId)
+                ? incomingId
+                : crypto.randomUUID();
+        // Only the path is logged: query strings can carry tokens.
+        const { pathname } = new URL(request.url);
+        const match = pathname === "/health" ? null : findUpstream(pathname);
 
         const response = await route(
             request,
+            pathname,
+            match,
             clientIp,
             forwardedFor,
             requestId,
@@ -174,14 +190,14 @@ export function createGateway(config: GatewayConfig) {
         }
         response.headers.set("X-Request-Id", requestId);
 
-        const { pathname } = new URL(request.url);
-        config.log({
-            level: "info",
+        config.log.info("request", {
             requestId,
             method: request.method,
             path: pathname,
             status: response.status,
             ms: Math.round(performance.now() - started),
+            upstream: match?.name,
+            clientIp,
         });
         return response;
     };
